@@ -2,6 +2,8 @@
 """
 Minimal personal Telegram bot for SMS Gateway.
 - Only allowed Telegram user IDs can use it
+- Multiple concurrent orders (each waits up to 8 min)
+- Menu "Мои коды" shows only numbers that already received SMS
 - No database, everything in memory
 - Safe for public GitHub (secrets only via env)
 """
@@ -12,7 +14,6 @@ import os
 import ssl
 import threading
 import time
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, List, Optional, Tuple
 
@@ -52,7 +53,7 @@ logging.basicConfig(
 log = logging.getLogger("sms-bot")
 
 # ---------------------------------------------------------------------------
-# Routes (copied from your CLI)
+# Routes
 # ---------------------------------------------------------------------------
 ROUTES: List[Tuple[str, str, str, str, str]] = [
     ("Russia", "MTS", "drp", "0", ""),
@@ -131,11 +132,10 @@ ISO = {
     "Venezuela": ("VE", "+58"),
 }
 
-# Unique countries for the first menu
 COUNTRIES = sorted({r[0] for r in ROUTES})
 
 # ---------------------------------------------------------------------------
-# SSL (API is on IP, cert usually fails)
+# SSL
 # ---------------------------------------------------------------------------
 def _ssl_ctx():
     ctx = ssl.create_default_context()
@@ -146,7 +146,7 @@ def _ssl_ctx():
 SSL_CTX = _ssl_ctx()
 
 # ---------------------------------------------------------------------------
-# API helpers
+# API
 # ---------------------------------------------------------------------------
 def api(method: str, path: str, body: Optional[dict] = None, timeout: int = 30):
     import urllib.request
@@ -178,19 +178,11 @@ def error_text(status: int, data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# In-memory active orders: user_id -> list of orders
+# In-memory state
+# order fields:
+#   act_id, phone, country, ops, svc, started, chat_id, msg_id,
+#   stop, code (None until received), finished
 # ---------------------------------------------------------------------------
-# order = {
-#   "act_id": str,
-#   "phone": str,
-#   "country": str,
-#   "ops": str,
-#   "svc": str,
-#   "started": float,
-#   "chat_id": int,
-#   "msg_id": int,
-#   "stop": bool,
-# }
 ACTIVE: Dict[int, List[dict]] = {}
 ACTIVE_LOCK = threading.Lock()
 
@@ -215,6 +207,13 @@ def deny(message_or_call):
 
 
 # ---------- Keyboards ----------
+
+def main_kb() -> types.ReplyKeyboardMarkup:
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add("🌍 Номер", "📬 Мои коды")
+    kb.add("📋 Ожидают", "ℹ️ Помощь")
+    return kb
+
 
 def countries_kb(page: int = 0) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -256,10 +255,57 @@ def operators_kb(country: str) -> types.InlineKeyboardMarkup:
 def order_kb(act_id: str) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
     kb.row(
-        types.InlineKeyboardButton("🔄 Проверить SMS", callback_data=f"check:{act_id}"),
+        types.InlineKeyboardButton("🔄 Проверить", callback_data=f"check:{act_id}"),
         types.InlineKeyboardButton("❌ Стоп", callback_data=f"stop:{act_id}"),
     )
     return kb
+
+
+# ---------- Helpers for lists ----------
+
+def get_orders(user_id: int) -> List[dict]:
+    with ACTIVE_LOCK:
+        return list(ACTIVE.get(user_id, []))
+
+
+def received_orders(user_id: int) -> List[dict]:
+    return [o for o in get_orders(user_id) if o.get("code")]
+
+
+def waiting_orders(user_id: int) -> List[dict]:
+    return [o for o in get_orders(user_id) if not o.get("finished") and not o.get("code")]
+
+
+def format_received(orders: List[dict]) -> str:
+    if not orders:
+        return "Пока нет полученных кодов."
+    lines = ["📬 <b>Полученные коды</b>\n"]
+    for i, o in enumerate(reversed(orders[-20:]), 1):
+        iso = ISO.get(o["country"], ("", ""))[0]
+        lines.append(
+            f"<b>{i}.</b> {iso} <code>+{o['phone']}</code>\n"
+            f"Код: <code>{o['code']}</code>\n"
+            f"{o['country']} · {o['ops']} · {o['svc']}\n"
+            f"<code>{o['act_id']}</code>\n"
+        )
+    return "\n".join(lines)
+
+
+def format_waiting(orders: List[dict]) -> str:
+    if not orders:
+        return "Сейчас ничего не ожидается."
+    lines = ["📋 <b>Ожидают SMS</b>\n"]
+    now = time.time()
+    for i, o in enumerate(orders, 1):
+        left = max(0, int(MAX_WAIT - (now - o["started"])))
+        iso = ISO.get(o["country"], ("", ""))[0]
+        lines.append(
+            f"<b>{i}.</b> {iso} <code>+{o['phone']}</code>\n"
+            f"{o['country']} · {o['ops']} · {o['svc']}\n"
+            f"осталось ~{left // 60}м {left % 60}с\n"
+            f"<code>{o['act_id']}</code>\n"
+        )
+    return "\n".join(lines)
 
 
 # ---------- Handlers ----------
@@ -270,8 +316,8 @@ def cmd_start(message: types.Message):
         return deny(message)
     bot.send_message(
         message.chat.id,
-        "Выбери страну:",
-        reply_markup=countries_kb(0),
+        "Личный SMS-бот.\nВыбери действие:",
+        reply_markup=main_kb(),
     )
 
 
@@ -281,10 +327,44 @@ def cmd_help(message: types.Message):
         return deny(message)
     bot.reply_to(
         message,
-        "Личный бот для получения номеров.\n"
-        "/start — выбрать страну\n"
-        "Кнопки под номером — проверить SMS или остановить ожидание.",
+        "🌍 <b>Номер</b> — выбрать страну и заказать\n"
+        "📬 <b>Мои коды</b> — только те, куда SMS уже пришла\n"
+        "📋 <b>Ожидают</b> — текущая очередь (до 8 мин каждый)\n\n"
+        "Можно заказывать несколько номеров параллельно.",
+        reply_markup=main_kb(),
     )
+
+
+@bot.message_handler(func=lambda m: m.text == "🌍 Номер")
+def btn_number(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return deny(message)
+    bot.send_message(
+        message.chat.id,
+        "Выбери страну:",
+        reply_markup=countries_kb(0),
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "📬 Мои коды")
+def btn_codes(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return deny(message)
+    orders = received_orders(message.from_user.id)
+    bot.send_message(message.chat.id, format_received(orders), reply_markup=main_kb())
+
+
+@bot.message_handler(func=lambda m: m.text == "📋 Ожидают")
+def btn_waiting(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return deny(message)
+    orders = waiting_orders(message.from_user.id)
+    bot.send_message(message.chat.id, format_waiting(orders), reply_markup=main_kb())
+
+
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Помощь")
+def btn_help(message: types.Message):
+    cmd_help(message)
 
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -295,7 +375,6 @@ def on_callback(call: types.CallbackQuery):
     data = call.data or ""
     bot.answer_callback_query(call.id)
 
-    # Pagination
     if data.startswith("p:"):
         page = int(data.split(":")[1])
         bot.edit_message_text(
@@ -306,12 +385,10 @@ def on_callback(call: types.CallbackQuery):
         )
         return
 
-    # Country selected → show operators
     if data.startswith("c:"):
         country = data[2:]
         ops = [r for r in ROUTES if r[0] == country]
         if len(ops) == 1:
-            # only one operator — order immediately
             order_number(call, ops[0])
         else:
             bot.edit_message_text(
@@ -322,7 +399,6 @@ def on_callback(call: types.CallbackQuery):
             )
         return
 
-    # Operator selected
     if data.startswith("o:"):
         parts = data.split(":")
         country = parts[1]
@@ -332,21 +408,22 @@ def on_callback(call: types.CallbackQuery):
             order_number(call, ops[idx])
         return
 
-    # Check SMS
     if data.startswith("check:"):
         act_id = data[6:]
         check_sms(call, act_id)
         return
 
-    # Stop waiting
     if data.startswith("stop:"):
         act_id = data[5:]
         stop_order(call.from_user.id, act_id)
-        bot.edit_message_reply_markup(
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=None,
-        )
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
         bot.send_message(call.message.chat.id, f"Ожидание остановлено.\nID: <code>{act_id}</code>")
         return
 
@@ -396,7 +473,8 @@ def order_number(call: types.CallbackQuery, route: Tuple[str, str, str, str, str
         f"<code>{svc}</code> · country={code}\n"
         f"ID: <code>{act_id}</code>\n\n"
         f"<code>+{phone}</code>\n"
-        f"<code>{phone}</code>"
+        f"<code>{phone}</code>\n\n"
+        f"⏳ Ожидаю SMS (до 8 мин)…"
     )
 
     msg = bot.edit_message_text(
@@ -414,17 +492,16 @@ def order_number(call: types.CallbackQuery, route: Tuple[str, str, str, str, str
         "svc": svc,
         "started": time.time(),
         "chat_id": chat_id,
-        "msg_id": msg.message_id if hasattr(msg, "message_id") else call.message.message_id,
+        "msg_id": getattr(msg, "message_id", call.message.message_id),
         "stop": False,
+        "code": None,
+        "finished": False,
     }
 
     with ACTIVE_LOCK:
         ACTIVE.setdefault(user_id, []).append(order)
 
-    # background waiter
-    t = threading.Thread(target=wait_sms, args=(user_id, order), daemon=True)
-    t.start()
-
+    threading.Thread(target=wait_sms, args=(user_id, order), daemon=True).start()
     log.info("ORDER ok user=%s phone=+%s id=%s", user_id, phone, act_id)
 
 
@@ -443,23 +520,34 @@ def check_sms(call: types.CallbackQuery, act_id: str):
     code = data.get("sms_code")
 
     if st == "sms_received" and code:
+        mark_received(call.from_user.id, act_id, code)
         bot.send_message(
             call.message.chat.id,
             f"✅ <b>КОД:</b> <code>{code}</code>\n"
             f"Номер: <code>+{data.get('phone_number', '')}</code>\n"
             f"ID: <code>{act_id}</code>",
         )
-        stop_order(call.from_user.id, act_id)
     else:
         bot.answer_callback_query(call.id, f"Статус: {st}", show_alert=False)
 
 
+def mark_received(user_id: int, act_id: str, code: str):
+    with ACTIVE_LOCK:
+        for o in ACTIVE.get(user_id, []):
+            if o["act_id"] == act_id:
+                o["code"] = code
+                o["finished"] = True
+                o["stop"] = True
+                break
+
+
 def stop_order(user_id: int, act_id: str):
     with ACTIVE_LOCK:
-        orders = ACTIVE.get(user_id, [])
-        for o in orders:
+        for o in ACTIVE.get(user_id, []):
             if o["act_id"] == act_id:
                 o["stop"] = True
+                o["finished"] = True
+                break
 
 
 def wait_sms(user_id: int, order: dict):
@@ -487,35 +575,36 @@ def wait_sms(user_id: int, order: dict):
         code = data.get("sms_code")
 
         if st == "sms_received" and code:
+            mark_received(user_id, act_id, code)
             bot.send_message(
                 chat_id,
                 f"✅ <b>КОД:</b> <code>{code}</code>\n"
                 f"Номер: <code>+{phone}</code>\n"
-                f"ID: <code>{act_id}</code>",
+                f"ID: <code>{act_id}</code>\n\n"
+                f"(сохранён в «Мои коды»)",
             )
-            stop_order(user_id, act_id)
             log.info("CODE received id=%s code=%s", act_id, code)
             return
 
         if st in ("failed", "expired", "closed"):
+            stop_order(user_id, act_id)
             bot.send_message(
                 chat_id,
                 f"⚠️ Заказ завершён без кода (status={st})\nID: <code>{act_id}</code>",
             )
-            stop_order(user_id, act_id)
             return
 
         poll = max(3, int(data.get("poll_after_seconds") or 5))
 
+    stop_order(user_id, act_id)
     bot.send_message(
         chat_id,
-        f"⏰ Время ожидания вышло\nID: <code>{act_id}</code>",
+        f"⏰ Время ожидания вышло (8 мин)\nID: <code>{act_id}</code>",
     )
-    stop_order(user_id, act_id)
 
 
 # ---------------------------------------------------------------------------
-# Tiny health server for Render keep-alive (cron can ping /)
+# Health server for Render
 # ---------------------------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -525,7 +614,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
     def log_message(self, format, *args):
-        pass  # silence
+        pass
 
 
 def run_health_server():
@@ -540,9 +629,5 @@ def run_health_server():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     log.info("Starting bot… allowed users: %s", ALLOWED_IDS)
-
-    # health endpoint in background (needed for Render free + cron ping)
     threading.Thread(target=run_health_server, daemon=True).start()
-
-    # long polling
     bot.infinity_polling(timeout=30, long_polling_timeout=25, skip_pending=True)
