@@ -630,4 +630,12 @@ def run_health_server():
 if __name__ == "__main__":
     log.info("Starting bot… allowed users: %s", ALLOWED_IDS)
     threading.Thread(target=run_health_server, daemon=True).start()
+
+    # Clear any previous webhook / concurrent getUpdates to avoid 409 Conflict
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted, pending updates dropped")
+    except Exception as e:
+        log.warning("delete_webhook failed: %s", e)
+
     bot.infinity_polling(timeout=30, long_polling_timeout=25, skip_pending=True)
