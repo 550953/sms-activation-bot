@@ -638,4 +638,4 @@ if __name__ == "__main__":
     except Exception as e:
         log.warning("delete_webhook failed: %s", e)
 
-    bot.infinity_polling(timeout=30, long_polling_timeout=25, skip_pending=True)
+    bot.infinity_polling(timeout=30, long_polling_timeout=25)
